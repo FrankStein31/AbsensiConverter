@@ -48,15 +48,27 @@ class AbsensiController extends Controller
 
             (new Xlsx($spreadsheet))->save($outputPath);
 
+            $filename = 'Rekap Absensi - '.now()->format('d-m-Y').'.xlsx';
+
             return response()->download(
                 $outputPath,
-                'Rekap Absensi - '.now()->format('d-m-Y').'.xlsx'
+                $filename,
+                [
+                    'X-Download-Filename' => $filename,
+                ]
             )->deleteFileAfterSend(true);
         } catch (\Throwable $e) {
             Log::error('AbsensiController: gagal memproses rekap absensi', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
+
+            // Jika request AJAX, kembalikan JSON error
+            if ($request->ajax() || $request->wantsJson()) {
+                return response()->json([
+                    'error' => 'Gagal memproses file. Pastikan format dan isi file sesuai, lalu coba kembali.',
+                ], 422);
+            }
 
             return back()
                 ->withInput()

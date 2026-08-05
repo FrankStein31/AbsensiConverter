@@ -21,10 +21,16 @@ use RuntimeException;
  * - Formula bawaan template (kolom L,N,P,R,T,V,X,H) TIDAK disentuh, hanya
  *   kolom tanggal (K,M,O,Q,S,U,W) dan Catatan (Y) yang diisi.
  *
- * ASUMSI YANG PERLU DIKONFIRMASI / DISESUAIKAN (lihat CODE_MAP di bawah):
- * kode di Keterangan_Lain.xlsx (s, sn, c, i, l, a, ...) — arti persisnya
- * ditebak dari contoh data. Ubah CODE_MAP jika arti berbeda di perusahaan
- * Anda, tidak perlu mengubah logika lain di kelas ini.
+ * ATURAN LIBUR:
+ * - Libur ditentukan dari jadwal (Jadwal Info) pada StandardReport, BUKAN
+ *   dari kode manual di Keterangan_Lain. Jika suatu tanggal menurut jadwal
+ *   bukan hari kerja normal, tanggal itu otomatis dikategorikan "libur" dan
+ *   MENIMPA kode apapun (s/sn/c/i/is) yang mungkin salah diisi di
+ *   Keterangan_Lain untuk tanggal tsb.
+ *
+ * FORMAT TANGGAL:
+ * - Semua tanggal disimpan sebagai "d/m" (contoh: "26/5", "1/6") agar jelas
+ *   bulannya dan bisa diurutkan kronologis lintas bulan.
  */
 class AbsensiRekapService
 {
@@ -36,7 +42,7 @@ class AbsensiRekapService
         'i' => 'izin',
         'l' => 'libur',
         'a' => 'alpa',           // alpa yang sudah ditandai manual oleh admin
-        'ih' => 'izin_setengah',  // izin setengah hari (kode belum terverifikasi, sesuaikan bila beda)
+        'is' => 'izin_setengah',  // izin setengah hari
     ];
 
     /** kategori -> kolom "Tanggal ..." di template_gaji.xlsx (kolom "Jumlah ..." sebelahnya sudah berisi formula, tidak disentuh). */
@@ -79,8 +85,12 @@ class AbsensiRekapService
             );
         }
 
+        // --- Ambil bulan awal dari info periode di sheet (biasanya baris 3, misal "2026-05-26 ~ 2026-06-25")
+        $bulanAwalJadwal = $this->deteksiBulanAwal($jadwalSheet, 3);
+        $bulanAwalLog = $this->deteksiBulanAwal($logSheet, 3);
+
         // --- Sheet "Jadwal Info": ID (A), Nama (B), Departemen (C), lalu tanggal mulai kolom D.
-        $tanggalJadwal = $this->bacaHeaderTanggal($jadwalSheet, 3, 4);
+        $tanggalJadwal = $this->bacaHeaderTanggal($jadwalSheet, 3, 4, $bulanAwalJadwal);
 
         $karyawan = [];
         $row = 5;
@@ -92,14 +102,14 @@ class AbsensiRekapService
             $nama = trim((string) $jadwalSheet->getCell('B'.$row)->getValue());
 
             $jadwalPerTanggal = [];
-            foreach ($tanggalJadwal as $tanggal => $col) {
-                $jadwalPerTanggal[$tanggal] = $jadwalSheet->getCell($col.$row)->getValue();
+            foreach ($tanggalJadwal as $tanggalKey => $col) {
+                $jadwalPerTanggal[$tanggalKey] = $jadwalSheet->getCell($col.$row)->getValue();
             }
 
             $karyawan[$id] = [
                 'id' => $id,
                 'nama' => $nama,
-                'jadwal' => $jadwalPerTanggal, // 1 = hari kerja normal; kosong/lain = bukan hari kerja normal
+                'jadwal' => $jadwalPerTanggal, // 1 = hari kerja normal; kosong/lain = bukan hari kerja normal (libur)
                 'kosong_absen' => [],
                 'tidak_finger_pagi' => [],
                 'tidak_finger_sore' => [],
@@ -108,7 +118,7 @@ class AbsensiRekapService
         }
 
         // --- Sheet "Lap. Log Absen": blok per-karyawan (baris "ID:" lalu baris jam di bawahnya).
-        $tanggalLog = $this->bacaHeaderTanggal($logSheet, 4, 1);
+        $tanggalLog = $this->bacaHeaderTanggal($logSheet, 4, 1, $bulanAwalLog);
         $highestRow = $logSheet->getHighestRow();
 
         for ($r = 1; $r <= $highestRow; $r++) {
@@ -122,30 +132,32 @@ class AbsensiRekapService
                 continue; // ID di log tidak ada di Jadwal Info, lewati
             }
 
-            foreach ($tanggalLog as $tanggal => $col) {
+            foreach ($tanggalLog as $tanggalKey => $col) {
                 $jam = trim((string) $logSheet->getCell($col.$dataRow)->getValue());
-                $hariKerjaNormal = in_array($karyawan[$id]['jadwal'][$tanggal] ?? null, [1, 1.0, '1'], true);
+                $hariKerjaNormal = in_array($karyawan[$id]['jadwal'][$tanggalKey] ?? null, [1, 1.0, '1'], true);
 
                 if (! $hariKerjaNormal) {
                     continue;
                 }
 
                 if ($jam === '') {
-                    $karyawan[$id]['kosong_absen'][] = $tanggal;
+                    $karyawan[$id]['kosong_absen'][] = $tanggalKey;
 
                     continue;
                 }
 
                 // Kolom jam digabung tanpa pemisah antar sesi, mis. "07:5316:02" =
                 // sesi 1 "07:53" (pagi) + sesi 2 "16:02" (sore). Ambil per 5 karakter,
-                // jam < 12 dianggap sesi pagi, >= 12 dianggap sesi sore.
+                // jam < 12 dianggap sesi pagi, >= 12 dianggap sesi sore. Bisa ada lebih
+                // dari 1 sesi pagi/sore (double finger) — untuk deteksi ada/tidaknya
+                // sesi, cukup ditandai true begitu ketemu minimal satu.
                 [$adaPagi, $adaSore] = $this->klasifikasiJam($jam);
 
                 if (! $adaPagi) {
-                    $karyawan[$id]['tidak_finger_pagi'][] = $tanggal;
+                    $karyawan[$id]['tidak_finger_pagi'][] = $tanggalKey;
                 }
                 if (! $adaSore) {
-                    $karyawan[$id]['tidak_finger_sore'][] = $tanggal;
+                    $karyawan[$id]['tidak_finger_sore'][] = $tanggalKey;
                 }
             }
         }
@@ -182,14 +194,15 @@ class AbsensiRekapService
 
     /**
      * @return array<string, array<string, string[]>>
-     *                                                [id_karyawan][kategori] = daftar tanggal (angka, sesuai kolom header sheet SCIL)
+     *                                                [id_karyawan][kategori] = daftar tanggal (format "d/m")
      */
     private function parseKeteranganLain(string $path): array
     {
         $spreadsheet = IOFactory::load($path);
         $sheet = $spreadsheet->getSheetByName('SCIL') ?? $spreadsheet->getSheet(0);
 
-        $tanggalCol = $this->bacaHeaderTanggal($sheet, 4, 3);
+        $bulanAwal = $this->deteksiBulanAwal($sheet, 3);
+        $tanggalCol = $this->bacaHeaderTanggal($sheet, 4, 3, $bulanAwal);
 
         $hasil = [];
         $row = 5;
@@ -199,7 +212,7 @@ class AbsensiRekapService
                 break;
             }
 
-            foreach ($tanggalCol as $tanggal => $col) {
+            foreach ($tanggalCol as $tanggalKey => $col) {
                 $kodeMentah = strtolower(trim((string) $sheet->getCell($col.$row)->getValue()));
                 if ($kodeMentah === '') {
                     continue;
@@ -209,7 +222,7 @@ class AbsensiRekapService
                     // kode tidak dikenal -> tetap dicatat sebagai "lainnya" supaya tidak hilang diam-diam
                     $kategori = 'lainnya_'.$kodeMentah;
                 }
-                $hasil[$id][$kategori][] = $tanggal;
+                $hasil[$id][$kategori][] = $tanggalKey;
             }
             $row++;
         }
@@ -219,6 +232,9 @@ class AbsensiRekapService
 
     /**
      * Gabungkan hasil StandardReport + Keterangan_Lain jadi satu rekap final per karyawan.
+     *
+     * Libur dihitung dari jadwal (bukan dari kode manual), dan menimpa kategori
+     * lain di tanggal yang sama apabila ada kode yang salah diisi pada hari libur.
      */
     private function gabungkan(array $karyawan, array $keterangan): array
     {
@@ -226,25 +242,49 @@ class AbsensiRekapService
 
         foreach ($karyawan as $id => $data) {
             $kategoriDariKeterangan = $keterangan[$id] ?? [];
+            $jadwal = $data['jadwal'] ?? [];
 
-            // tanggal yang SUDAH dijelaskan oleh Keterangan_Lain (selain kode alpa 'a')
-            $sudahDijelaskan = [];
+            // Tanggal yang menurut jadwal BUKAN hari kerja normal -> otomatis libur.
+            $liburDariJadwal = [];
+            foreach ($jadwal as $tanggal => $nilai) {
+                $hariKerjaNormal = in_array($nilai, [1, 1.0, '1'], true);
+                if (! $hariKerjaNormal) {
+                    $liburDariJadwal[] = $tanggal;
+                }
+            }
+
+            // Buang tanggal libur (menurut jadwal) dari kategori lain, supaya kode
+            // yang salah diisi (mis. 's' pada hari libur) tidak ikut terhitung.
+            foreach ($kategoriDariKeterangan as $kategoriKey => $tanggalList) {
+                if ($kategoriKey === 'libur') {
+                    continue;
+                }
+                $kategoriDariKeterangan[$kategoriKey] = array_values(array_diff($tanggalList, $liburDariJadwal));
+            }
+
+            $liburManual = $kategoriDariKeterangan['libur'] ?? [];
+            $libur = array_values(array_unique(array_merge($liburDariJadwal, $liburManual)));
+            $this->sortTanggal($libur);
+
+            // tanggal yang SUDAH dijelaskan (selain kode alpa 'a'); libur juga
+            // "menjelaskan" ketidakhadiran sehingga tidak dianggap alpa.
+            $sudahDijelaskan = $libur;
             foreach ($kategoriDariKeterangan as $kategori => $tanggalList) {
-                if ($kategori === 'alpa') {
+                if (in_array($kategori, ['alpa', 'libur'], true)) {
                     continue;
                 }
                 $sudahDijelaskan = array_merge($sudahDijelaskan, $tanggalList);
             }
 
             $alpaOtomatis = array_diff($data['kosong_absen'], $sudahDijelaskan);
-            $alpaManual = $kategoriDariKeterangan['alpa'] ?? [];
+            $alpaManual = array_diff($kategoriDariKeterangan['alpa'] ?? [], $liburDariJadwal);
             $alpa = array_values(array_unique(array_merge($alpaOtomatis, $alpaManual)));
-            sort($alpa, SORT_NUMERIC);
+            $this->sortTanggal($alpa);
 
             $rekap[$id] = [
                 'id' => $id,
                 'nama' => $data['nama'],
-                'kategori' => array_merge($kategoriDariKeterangan, ['alpa' => $alpa]),
+                'kategori' => array_merge($kategoriDariKeterangan, ['alpa' => $alpa, 'libur' => $libur]),
                 'tidak_finger_pagi' => $data['tidak_finger_pagi'] ?? [],
                 'tidak_finger_sore' => $data['tidak_finger_sore'] ?? [],
             ];
@@ -268,7 +308,7 @@ class AbsensiRekapService
 
             foreach (self::TEMPLATE_DATE_COLUMN as $kategori => $kolom) {
                 $tanggalList = $data['kategori'][$kategori] ?? [];
-                sort($tanggalList, SORT_NUMERIC);
+                $this->sortTanggal($tanggalList);
                 $sheet->setCellValue($kolom.$row, implode(',', $tanggalList));
             }
 
@@ -320,7 +360,7 @@ class AbsensiRekapService
             if (empty($tanggalList)) {
                 continue;
             }
-            sort($tanggalList, SORT_NUMERIC);
+            $this->sortTanggal($tanggalList);
             $bagian[] = 'tgl '.implode(', ', $tanggalList).' '.$teks;
         }
 
@@ -328,18 +368,18 @@ class AbsensiRekapService
             if (! str_starts_with($kategoriKey, 'lainnya_') || empty($tanggalList)) {
                 continue;
             }
-            sort($tanggalList, SORT_NUMERIC);
+            $this->sortTanggal($tanggalList);
             $kode = substr($kategoriKey, strlen('lainnya_'));
             $bagian[] = 'tgl '.implode(', ', $tanggalList)." kode '{$kode}' (kode tidak dikenal, cek CODE_MAP)";
         }
 
         if (! empty($tidakFingerPagi)) {
-            sort($tidakFingerPagi, SORT_NUMERIC);
+            $this->sortTanggal($tidakFingerPagi);
             $bagian[] = 'tgl '.implode(', ', $tidakFingerPagi).' tidak absen pagi';
         }
 
         if (! empty($tidakFingerSore)) {
-            sort($tidakFingerSore, SORT_NUMERIC);
+            $this->sortTanggal($tidakFingerSore);
             $bagian[] = 'tgl '.implode(', ', $tidakFingerSore).' tidak absen sore';
         }
 
@@ -347,23 +387,79 @@ class AbsensiRekapService
     }
 
     /**
+     * Deteksi bulan dan tahun awal periode dari teks info di sheet.
+     * Biasanya baris tertentu mengandung teks seperti "2026-05-26 ~ 2026-06-25"
+     * atau "Waktu Ab 2026-05-26 ~ 2026-06-25".
+     *
+     * @return array{bulan: int, tahun: int}|null
+     */
+    private function deteksiBulanAwal(Worksheet $sheet, int $scanRow): ?array
+    {
+        // Scan beberapa baris dan kolom terdekat untuk menemukan pola tanggal
+        for ($row = max(1, $scanRow - 2); $row <= $scanRow + 2; $row++) {
+            for ($col = 1; $col <= 10; $col++) {
+                $colLetter = Coordinate::stringFromColumnIndex($col);
+                $value = trim((string) $sheet->getCell($colLetter.$row)->getValue());
+
+                // Cari pola YYYY-MM-DD
+                if (preg_match('/(\d{4})-(\d{2})-(\d{2})/', $value, $m)) {
+                    return [
+                        'bulan' => (int) $m[2],
+                        'tahun' => (int) $m[1],
+                    ];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Cari kolom-kolom yang berisi header tanggal (angka 1-31) pada suatu
      * baris, mulai dari kolom tertentu, sampai kolom kosong berturut-turut.
      *
-     * @return array<int|string, string> [tanggal => kolom_excel]
+     * Sekarang mengembalikan key format "d/m" (misal "26/5", "1/6") agar
+     * tanggal lintas bulan bisa diurutkan secara kronologis.
+     *
+     * @param  array{bulan: int, tahun: int}|null  $bulanAwal  info bulan/tahun awal dari deteksiBulanAwal()
+     * @return array<string, string> [tanggal_key "d/m" => kolom_excel]
      */
-    private function bacaHeaderTanggal(Worksheet $sheet, int $headerRow, int $startColumnIndex): array
+    private function bacaHeaderTanggal(Worksheet $sheet, int $headerRow, int $startColumnIndex, ?array $bulanAwal): array
     {
         $hasil = [];
         $kolom = $startColumnIndex;
         $kosongBerturut = 0;
+
+        $bulanSekarang = $bulanAwal ? $bulanAwal['bulan'] : null;
+        $tahunSekarang = $bulanAwal ? $bulanAwal['tahun'] : null;
+        $tanggalSebelumnya = null;
 
         while ($kosongBerturut < 3) {
             $colLetter = Coordinate::stringFromColumnIndex($kolom);
             $value = $sheet->getCell($colLetter.$headerRow)->getValue();
 
             if (is_numeric($value) && (int) $value >= 1 && (int) $value <= 31) {
-                $hasil[(string) (int) $value] = $colLetter;
+                $tanggal = (int) $value;
+
+                // Deteksi pergantian bulan: jika tanggal sekarang < tanggal sebelumnya
+                // (misal 31 -> 1), berarti bulan naik
+                if ($tanggalSebelumnya !== null && $tanggal < $tanggalSebelumnya && $bulanSekarang !== null) {
+                    $bulanSekarang++;
+                    if ($bulanSekarang > 12) {
+                        $bulanSekarang = 1;
+                        $tahunSekarang++;
+                    }
+                }
+                $tanggalSebelumnya = $tanggal;
+
+                // Bangun key: jika bulan diketahui, format "d/m", jika tidak fallback ke angka saja
+                if ($bulanSekarang !== null) {
+                    $key = $tanggal.'/'.$bulanSekarang;
+                } else {
+                    $key = (string) $tanggal;
+                }
+
+                $hasil[$key] = $colLetter;
                 $kosongBerturut = 0;
             } else {
                 $kosongBerturut++;
@@ -376,5 +472,49 @@ class AbsensiRekapService
         }
 
         return $hasil;
+    }
+
+    /**
+     * Sort array tanggal format "d/m" secara kronologis.
+     * Menangani lintas bulan dengan benar (misal 30/5 sebelum 1/6).
+     *
+     * @param  string[]  $tanggalList  array tanggal (dimodifikasi in-place by reference)
+     */
+    private function sortTanggal(array &$tanggalList): void
+    {
+        usort($tanggalList, function (string $a, string $b): int {
+            $pa = $this->parseTanggalKey($a);
+            $pb = $this->parseTanggalKey($b);
+
+            // Bandingkan bulan dulu, lalu tanggal
+            if ($pa['bulan'] !== $pb['bulan']) {
+                return $pa['bulan'] - $pb['bulan'];
+            }
+
+            return $pa['tanggal'] - $pb['tanggal'];
+        });
+    }
+
+    /**
+     * Parse key tanggal "d/m" menjadi array [tanggal, bulan].
+     * Fallback: jika format lama (angka saja), bulan = 0.
+     *
+     * @return array{tanggal: int, bulan: int}
+     */
+    private function parseTanggalKey(string $key): array
+    {
+        if (str_contains($key, '/')) {
+            $parts = explode('/', $key);
+
+            return [
+                'tanggal' => (int) $parts[0],
+                'bulan' => (int) ($parts[1] ?? 0),
+            ];
+        }
+
+        return [
+            'tanggal' => (int) $key,
+            'bulan' => 0,
+        ];
     }
 }

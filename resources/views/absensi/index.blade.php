@@ -75,7 +75,6 @@
             </div>
             <span class="text-sm font-semibold text-slate-800 tracking-tight">Konverter Rekap Absensi</span>
         </div>
-        <span class="text-xs text-slate-400 hidden sm:block">Data tidak disimpan di server &bull; Scomptec</span>
     </header>
 
     <main class="max-w-2xl mx-auto px-4 py-8">
@@ -284,15 +283,33 @@
 
     </main>
 
+    {{-- Toast notification --}}
+    <div id="toast-success" class="fixed top-5 right-5 z-50 hidden">
+        <div class="flex items-center gap-2.5 bg-emerald-600 text-white px-4 py-3 rounded-md shadow-lg" style="animation: fadeSlideIn 0.3s ease forwards;">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <span class="text-sm font-medium">Rekap berhasil diunduh!</span>
+        </div>
+    </div>
+
+    <div id="toast-error" class="fixed top-5 right-5 z-50 hidden">
+        <div class="flex items-center gap-2.5 bg-red-600 text-white px-4 py-3 rounded-md shadow-lg" style="animation: fadeSlideIn 0.3s ease forwards;">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/>
+            </svg>
+            <span class="text-sm font-medium" id="toast-error-text">Gagal memproses file.</span>
+        </div>
+    </div>
+
     <script>
     (function () {
-        const fields = ['standard_report', 'keterangan_lain', 'template_gaji'];
-        const fileMap = {};  // nama field -> File object
+        var fields = ['standard_report', 'keterangan_lain', 'template_gaji'];
 
         // ── Drag & Drop setup ──────────────────────────────────────────────
         fields.forEach(function (name) {
-            const zone  = document.getElementById('zone-' + name);
-            const input = document.getElementById(name);
+            var zone  = document.getElementById('zone-' + name);
+            var input = document.getElementById(name);
 
             // Klik pada zona → buka dialog file
             zone.addEventListener('click', function () { input.click(); });
@@ -378,8 +395,65 @@
                 count + ' dari 3 file dipilih';
         }
 
-        // ── Form submit ────────────────────────────────────────────────────
+        // ── Reset form ke kondisi awal ─────────────────────────────────────
+        function resetForm() {
+            // Reset semua file input
+            fields.forEach(function (name) {
+                var input = document.getElementById(name);
+                var zone  = document.getElementById('zone-' + name);
+                var label = document.getElementById('label-' + name);
+                var chip  = document.getElementById('chip-' + name);
+
+                // Kosongkan input file
+                input.value = '';
+
+                // Reset zona
+                zone.classList.remove('has-file', 'border-red-400', 'bg-red-50');
+                zone.classList.add('border-slate-300');
+
+                // Reset label
+                if (label) {
+                    label.textContent = 'Drag file di sini';
+                }
+
+                // Sembunyikan chip
+                if (chip) {
+                    chip.classList.add('hidden');
+                }
+            });
+
+            updateProgress();
+        }
+
+        // ── Tombol kembali ke state normal ──────────────────────────────────
+        function resetButton() {
+            var btn  = document.getElementById('btn-proses');
+            var icon = document.getElementById('btn-icon');
+            var text = document.getElementById('btn-text');
+            btn.disabled = false;
+            icon.classList.remove('hidden');
+            text.innerHTML = 'Proses &amp; Unduh';
+        }
+
+        // ── Toast notifications ────────────────────────────────────────────
+        function showToast(type, message) {
+            var toastId = type === 'success' ? 'toast-success' : 'toast-error';
+            var toast = document.getElementById(toastId);
+
+            if (type === 'error' && message) {
+                document.getElementById('toast-error-text').textContent = message;
+            }
+
+            toast.classList.remove('hidden');
+            setTimeout(function () {
+                toast.classList.add('hidden');
+            }, 4000);
+        }
+
+        // ── Form submit via AJAX (fetch) ───────────────────────────────────
         document.getElementById('form-absensi').addEventListener('submit', function (e) {
+            e.preventDefault(); // Selalu prevent — kita handle semuanya via fetch
+
             var firstInvalid = null;
 
             fields.forEach(function (name) {
@@ -397,18 +471,90 @@
             });
 
             if (firstInvalid) {
-                e.preventDefault();
                 firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 return;
             }
 
-            // Double-submit prevention
+            // Aktifkan loading state
             var btn  = document.getElementById('btn-proses');
             var icon = document.getElementById('btn-icon');
             var text = document.getElementById('btn-text');
             btn.disabled = true;
             icon.classList.add('hidden');
             text.innerHTML = 'Memproses...<span class="spinner"></span>';
+
+            // Bangun FormData dari form
+            var form = document.getElementById('form-absensi');
+            var formData = new FormData(form);
+
+            fetch(form.action, {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/octet-stream, application/json',
+                },
+            })
+            .then(function (response) {
+                if (!response.ok) {
+                    // Coba parse sebagai JSON untuk pesan error
+                    return response.json().then(function (data) {
+                        // Laravel validation error format: {message: "...", errors: {...}}
+                        if (data.errors) {
+                            var msgs = [];
+                            for (var field in data.errors) {
+                                msgs = msgs.concat(data.errors[field]);
+                            }
+                            throw new Error(msgs.join('\n'));
+                        }
+                        throw new Error(data.error || data.message || 'Gagal memproses file.');
+                    }).catch(function (jsonErr) {
+                        // Jika error sudah di-throw dari blok atas, teruskan
+                        if (jsonErr instanceof Error) {
+                            throw jsonErr;
+                        }
+                        throw new Error('Gagal memproses file. Pastikan format dan isi file sesuai, lalu coba kembali.');
+                    });
+                }
+
+                // Ambil nama file dari header response
+                var filename = 'Rekap Absensi.xlsx';
+                var disposition = response.headers.get('Content-Disposition');
+                if (disposition) {
+                    var filenameMatch = disposition.match(/filename[^;=\n]*=["']?([^"';\n]*)["']?/);
+                    if (filenameMatch && filenameMatch[1]) {
+                        filename = decodeURIComponent(filenameMatch[1].replace(/['"]/g, ''));
+                    }
+                }
+                var customFilename = response.headers.get('X-Download-Filename');
+                if (customFilename) {
+                    filename = customFilename;
+                }
+
+                return response.blob().then(function (blob) {
+                    return { blob: blob, filename: filename };
+                });
+            })
+            .then(function (result) {
+                // Trigger download manual via blob URL
+                var url = window.URL.createObjectURL(result.blob);
+                var a = document.createElement('a');
+                a.href = url;
+                a.download = result.filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+
+                // Sukses: reset button, reset form, tampilkan toast
+                resetButton();
+                resetForm();
+                showToast('success');
+            })
+            .catch(function (error) {
+                resetButton();
+                showToast('error', error.message);
+            });
         });
 
     })();
