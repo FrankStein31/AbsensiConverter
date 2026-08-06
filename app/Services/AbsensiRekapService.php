@@ -33,6 +33,16 @@ use RuntimeException;
  * - Pencocokan datanya sendiri (StandardReport <-> Keterangan_Lain <->
  *   template_gaji) tetap berdasarkan kecocokan ID, bukan nama/urutan.
  *
+ * TANGGAL YANG DIREKAP (patokan: periode Lap. Log Absen):
+ * - Sama seperti daftar karyawan, daftar TANGGAL yang sah juga mengikuti
+ *   header tanggal pada sheet "Lap. Log Absen" (Standard Report), bukan
+ *   header tanggal di Keterangan_Lain.
+ * - Jika header tanggal Keterangan_Lain berisi tanggal yang tidak ada di
+ *   periode Standard Report (mis. kolom "31" untuk bulan yang cuma 30
+ *   hari — kemungkinan human error saat mengisi file), kolom tsb DI-SKIP
+ *   sepenuhnya (kode apapun yang diisi di kolom itu diabaikan, tidak ikut
+ *   ke rekap/template).
+ *
  * PENCOCOKAN BARIS (berdasarkan ID, bukan urutan/nama):
  * - template_gaji.xlsx punya kolom ID di kolom AC. Baris existing di
  *   template_gaji TIDAK PERNAH ditimpa No/Nama/ID-nya — hanya kolom
@@ -119,7 +129,11 @@ class AbsensiRekapService
     public function generate(string $standardReportPath, string $keteranganLainPath, string $templatePath): Spreadsheet
     {
         $standardReport = $this->parseStandardReport($standardReportPath);
-        $keterangan = $this->parseKeteranganLain($keteranganLainPath, $standardReport['bulan_awal']);
+        $keterangan = $this->parseKeteranganLain(
+            $keteranganLainPath,
+            $standardReport['bulan_awal'],
+            $standardReport['tanggal_valid']
+        );
         $rekap = $this->gabungkan(
             $standardReport['karyawan'],
             $standardReport['libur_global'],
@@ -135,6 +149,7 @@ class AbsensiRekapService
      *     karyawan: array<string, array{id:string, nama:string, kosong_absen: string[], tidak_finger_pagi: string[], tidak_finger_sore: string[]}>,
      *     libur_global: string[],
      *     libur_minggu: string[],
+     *     tanggal_valid: string[],
      *     bulan_awal: array{bulan: int, tahun: int}|null
      * }
      *                keyed by ID karyawan. "kosong_absen" = tanggal (di luar libur global) yang tidak
@@ -142,6 +157,9 @@ class AbsensiRekapService
      *                menurut kalender adalah hari Minggu atau libur nasional/cuti bersama (dipakai
      *                untuk logika internal). "libur_minggu" = subset khusus hari Minggu saja (dipakai
      *                untuk menyaring kolom "Tanggal Libur" agar Minggu tidak ditampilkan di sana).
+     *                "tanggal_valid" = seluruh tanggal ("d/m") yang benar-benar ada di periode
+     *                Standard Report — dipakai untuk memvalidasi/menyaring tanggal dari
+     *                Keterangan_Lain (lihat parseKeteranganLain()).
      */
     private function parseStandardReport(string $path): array
     {
@@ -228,6 +246,7 @@ class AbsensiRekapService
             'karyawan' => $karyawan,
             'libur_global' => $liburGlobal,
             'libur_minggu' => $liburMinggu,
+            'tanggal_valid' => array_keys($tanggalLog),
             'bulan_awal' => $bulanAwalLog,
         ];
     }
@@ -336,16 +355,24 @@ class AbsensiRekapService
     }
 
     /**
+     * @param  string[]  $tanggalValid  daftar tanggal ("d/m") yang benar-benar ada di periode Standard
+     *                                  Report (hasil parseStandardReport()['tanggal_valid']). Kolom
+     *                                  tanggal di Keterangan_Lain yang headernya TIDAK ada dalam daftar
+     *                                  ini (mis. tanggal "31" yang salah ditulis untuk bulan yang
+     *                                  cuma 30 hari) akan DI-SKIP — patokan tanggal tetap Standard
+     *                                  Report, sama seperti patokan daftar ID karyawan. Jika kosong
+     *                                  (mis. dipanggil tanpa Standard Report), tidak ada penyaringan.
      * @return array<string, array{nama: string, kategori: array<string, string[]>}>
      *                                                                               [id_karyawan] => nama + [kategori] = daftar tanggal (format "d/m")
      */
-    private function parseKeteranganLain(string $path, ?array $bulanAwalFallback = null): array
+    private function parseKeteranganLain(string $path, ?array $bulanAwalFallback = null, array $tanggalValid = []): array
     {
         $spreadsheet = IOFactory::load($path);
         $sheet = $spreadsheet->getSheetByName('SCIL') ?? $spreadsheet->getSheet(0);
 
         $bulanAwal = $this->deteksiBulanAwal($sheet, 3) ?? $bulanAwalFallback;
         $tanggalCol = $this->bacaHeaderTanggal($sheet, 4, 3, $bulanAwal);
+        $tanggalValidSet = array_flip($tanggalValid);
 
         $hasil = [];
         $row = 5;
@@ -363,6 +390,13 @@ class AbsensiRekapService
             }
 
             foreach ($tanggalCol as $tanggalKey => $info) {
+                if (! empty($tanggalValid) && ! isset($tanggalValidSet[$tanggalKey])) {
+                    // Tanggal di header Keterangan_Lain ini tidak ada di periode Standard Report
+                    // (mis. kolom "31" untuk bulan yang cuma 30 hari) -> skip, patokan tetap
+                    // Standard Report.
+                    continue;
+                }
+
                 $kodeMentah = strtolower(trim((string) $sheet->getCell($info['kolom'].$row)->getValue()));
                 if ($kodeMentah === '') {
                     continue;
