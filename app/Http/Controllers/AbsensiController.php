@@ -27,7 +27,7 @@ class AbsensiController extends Controller
             'template_gaji' => 'file Template Gaji',
         ]);
 
-        $dir = storage_path('app/tmp-absensi/'.Str::uuid());
+        $dir = public_path('tmp-absensi/'.Str::uuid());
 
         if (! is_dir($dir)) {
             mkdir($dir, 0775, true);

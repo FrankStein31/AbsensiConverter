@@ -34,8 +34,14 @@
             opacity: 1 !important;
         }
         .drop-zone.has-file {
-            border-color: #94a3b8;
-            background-color: #f8fafc;
+            border-color: #22c55e !important;
+            background-color: #f0fdf4 !important;
+        }
+        .drop-zone.has-file .drop-icon-card {
+            background-color: #dcfce7 !important;
+        }
+        .drop-zone.has-file svg {
+            color: #16a34a !important;
         }
 
         /* Icon card animation */
