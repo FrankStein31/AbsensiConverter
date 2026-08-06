@@ -21,21 +21,32 @@ use RuntimeException;
  * - Formula bawaan template (kolom L,N,P,R,T,V,X,H) TIDAK disentuh, hanya
  *   kolom tanggal (K,M,O,Q,S,U,W) dan Catatan (Y) yang diisi.
  *
+ * DAFTAR KARYAWAN YANG DIREKAP (patokan: Lap. Log Absen):
+ * - Sumber kebenaran daftar karyawan adalah sheet "Lap. Log Absen" pada
+ *   StandardReport. Keterangan_Lain HANYA berfungsi sebagai data pendukung
+ *   (sakit/cuti/izin/libur) untuk ID yang SUDAH ada di Lap. Log Absen.
+ * - Jika sebuah ID muncul di Keterangan_Lain tapi TIDAK ditemukan di
+ *   Lap. Log Absen, ID tsb DI-SKIP sepenuhnya (tidak ikut direkap maupun
+ *   ditulis ke template_gaji) — kemungkinan besar human error (typo ID)
+ *   saat mengisi Keterangan_Lain, jadi tidak boleh memunculkan karyawan
+ *   baru yang sebenarnya tidak tercatat di mesin fingerprint.
+ * - Pencocokan datanya sendiri (StandardReport <-> Keterangan_Lain <->
+ *   template_gaji) tetap berdasarkan kecocokan ID, bukan nama/urutan.
+ *
  * PENCOCOKAN BARIS (berdasarkan ID, bukan urutan/nama):
  * - template_gaji.xlsx punya kolom ID di kolom AC. Baris existing di
  *   template_gaji TIDAK PERNAH ditimpa No/Nama/ID-nya — hanya kolom
  *   absensi (K,M,O,Q,S,U,W,Y) di baris tsb yang diisi/diperbarui, dicari
- *   berdasarkan kecocokan ID di kolom AC dengan ID dari StandardReport /
- *   Keterangan_Lain.
- * - Jika ID dari StandardReport/Keterangan_Lain TIDAK ditemukan di kolom AC
- *   template_gaji (karyawan baru), baris baru ditambahkan tepat di bawah
- *   baris data terakhir yang sudah terisi di template_gaji (No lanjut,
- *   Nama & ID diisi, lalu kolom absensi).
+ *   berdasarkan kecocokan ID di kolom AC dengan ID dari StandardReport.
+ * - Jika ID dari StandardReport TIDAK ditemukan di kolom AC template_gaji
+ *   (karyawan baru), baris baru ditambahkan tepat di bawah baris data
+ *   terakhir yang sudah terisi di template_gaji (No lanjut, Nama & ID
+ *   diisi, lalu kolom absensi).
  * - Baris di template_gaji yang punya Nama tapi kolom ID-nya kosong akan
  *   DILEWATI dari pencocokan (tidak diisi/disentuh sama sekali) karena
  *   patokan pencocokan adalah ID, bukan nama.
- * - Karyawan dari StandardReport/Keterangan_Lain yang ID-nya kosong juga
- *   dilewati (tidak bisa dicocokkan maupun ditambahkan tanpa ID).
+ * - Karyawan dari StandardReport yang ID-nya kosong juga dilewati (tidak
+ *   bisa dicocokkan maupun ditambahkan tanpa ID).
  *
  * ATURAN LIBUR:
  * - TIDAK lagi memakai sheet "Jadwal Info" — StandardReport hanya dibaca dari
@@ -53,13 +64,31 @@ use RuntimeException;
  * - Tanggal yang sudah libur (dari kalender) akan MENIMPA kode apapun
  *   (s/sn/c/i/is) yang mungkin salah diisi di Keterangan_Lain untuk tanggal
  *   tsb.
+ * - TAMPILAN kolom "Tanggal Libur" di template TIDAK menyertakan hari
+ *   Minggu — hari Minggu tetap dihitung libur secara internal (supaya tidak
+ *   dianggap alpa) tapi tidak dicantumkan satu-satu di kolom. Yang tampil di
+ *   kolom hanya libur pada hari aktif Senin-Sabtu (libur nasional/cuti
+ *   bersama, termasuk yang ditandai manual kode 'l').
  *
  * FORMAT TANGGAL:
- * - Semua tanggal disimpan sebagai "d/m" (contoh: "26/5", "1/6") agar jelas
- *   bulannya dan bisa diurutkan kronologis lintas bulan.
+ * - Semua tanggal disimpan secara internal sebagai "d/m" (contoh: "26/5",
+ *   "1/6") agar jelas bulannya dan bisa diurutkan kronologis lintas bulan.
+ * - Untuk DITAMPILKAN (kolom tanggal di template_gaji & Catatan), daftar
+ *   tanggal ini dirapikan dan dikelompokkan per bulan dengan nama bulan
+ *   Indonesia, contoh: "26/5,28/5,29/5,1/6,2/6" -> "26, 28, 29 Mei, 1, 2
+ *   Juni". Lihat formatTanggalUntukTampilan(). Jumlah koma di hasil akhir
+ *   tetap sama dengan jumlah tanggal dikurangi 1, sehingga formula hitung
+ *   jumlah hari di template (mis. kolom L/N/P) tetap berfungsi benar.
  */
 class AbsensiRekapService
 {
+    /** Nama bulan Indonesia untuk formatTanggalUntukTampilan(). */
+    private const NAMA_BULAN = [
+        1 => 'Januari', 2 => 'Februari', 3 => 'Maret', 4 => 'April',
+        5 => 'Mei', 6 => 'Juni', 7 => 'Juli', 8 => 'Agustus',
+        9 => 'September', 10 => 'Oktober', 11 => 'November', 12 => 'Desember',
+    ];
+
     /** Kode pada sheet "SCIL" (Keterangan_Lain.xlsx) -> kategori internal. */
     private const CODE_MAP = [
         's' => 'sakit_skd',      // Sakit dengan Surat Keterangan Dokter
@@ -91,7 +120,12 @@ class AbsensiRekapService
     {
         $standardReport = $this->parseStandardReport($standardReportPath);
         $keterangan = $this->parseKeteranganLain($keteranganLainPath, $standardReport['bulan_awal']);
-        $rekap = $this->gabungkan($standardReport['karyawan'], $standardReport['libur_global'], $keterangan);
+        $rekap = $this->gabungkan(
+            $standardReport['karyawan'],
+            $standardReport['libur_global'],
+            $standardReport['libur_minggu'],
+            $keterangan
+        );
 
         return $this->isiTemplate($templatePath, $rekap);
     }
@@ -100,11 +134,14 @@ class AbsensiRekapService
      * @return array{
      *     karyawan: array<string, array{id:string, nama:string, kosong_absen: string[], tidak_finger_pagi: string[], tidak_finger_sore: string[]}>,
      *     libur_global: string[],
+     *     libur_minggu: string[],
      *     bulan_awal: array{bulan: int, tahun: int}|null
      * }
      *                keyed by ID karyawan. "kosong_absen" = tanggal (di luar libur global) yang tidak
      *                ada satu pun log jam masuk/pulang. "libur_global" = daftar tanggal ("d/m") yang
-     *                menurut kalender adalah hari Minggu atau libur nasional/cuti bersama.
+     *                menurut kalender adalah hari Minggu atau libur nasional/cuti bersama (dipakai
+     *                untuk logika internal). "libur_minggu" = subset khusus hari Minggu saja (dipakai
+     *                untuk menyaring kolom "Tanggal Libur" agar Minggu tidak ditampilkan di sana).
      */
     private function parseStandardReport(string $path): array
     {
@@ -125,7 +162,9 @@ class AbsensiRekapService
         $tanggalLog = $this->bacaHeaderTanggal($logSheet, 4, 1, $bulanAwalLog);
 
         // --- Libur global (Minggu + libur nasional/cuti bersama dari kalender), berlaku untuk semua karyawan.
-        $liburGlobal = $this->hitungLiburGlobal($tanggalLog);
+        $liburHasil = $this->hitungLiburGlobal($tanggalLog);
+        $liburGlobal = $liburHasil['semua'];
+        $liburMinggu = $liburHasil['minggu'];
         $liburGlobalSet = array_flip($liburGlobal);
 
         $karyawan = [];
@@ -188,6 +227,7 @@ class AbsensiRekapService
         return [
             'karyawan' => $karyawan,
             'libur_global' => $liburGlobal,
+            'libur_minggu' => $liburMinggu,
             'bulan_awal' => $bulanAwalLog,
         ];
     }
@@ -197,12 +237,18 @@ class AbsensiRekapService
      * semua karyawan): hari Minggu, atau libur nasional/cuti bersama menurut
      * library kalender Indonesia (irfa/php-hari-libur).
      *
+     * Mengembalikan 'semua' (Minggu + libur nasional, dipakai untuk logika
+     * internal seperti pengecualian alpa) dan 'minggu' (khusus hari Minggu
+     * saja, dipakai untuk MENYARING kolom "Tanggal Libur" di template agar
+     * hari Minggu tidak ikut ditampilkan di sana — lihat gabungkan()).
+     *
      * @param  array<string, array{kolom:string, tanggal:int, bulan:int, tahun:?int}>  $tanggalInfo
-     * @return string[]
+     * @return array{semua: string[], minggu: string[]}
      */
     private function hitungLiburGlobal(array $tanggalInfo): array
     {
         $liburGlobal = [];
+        $liburMinggu = [];
 
         foreach ($tanggalInfo as $tanggalKey => $info) {
             if ($info['tahun'] === null) {
@@ -219,12 +265,19 @@ class AbsensiRekapService
             // Libur nasional dapat ditandai secara manual dengan kode 'l' pada file Keterangan_Lain.
             $isLiburNasional = false;
 
+            if ($isMinggu) {
+                $liburMinggu[] = $tanggalKey;
+            }
+
             if ($isMinggu || $isLiburNasional) {
                 $liburGlobal[] = $tanggalKey;
             }
         }
 
-        return $liburGlobal;
+        return [
+            'semua' => $liburGlobal,
+            'minggu' => $liburMinggu,
+        ];
     }
 
     /**
@@ -330,24 +383,36 @@ class AbsensiRekapService
     /**
      * Gabungkan hasil StandardReport (Lap. Log Absen) + Keterangan_Lain jadi satu rekap final per karyawan.
      *
+     * PATOKAN DAFTAR KARYAWAN: Lap. Log Absen (StandardReport), BUKAN Keterangan_Lain.
+     * Jika sebuah ID hanya muncul di Keterangan_Lain tapi TIDAK ada di Lap. Log Absen,
+     * ID tsb DI-SKIP sepenuhnya (tidak ikut direkap/ditulis ke template) — dianggap
+     * kemungkinan human error (typo ID, dsb) di Keterangan_Lain. Pencocokan datanya
+     * sendiri tetap berdasarkan ID (bukan nama/urutan), sama seperti sebelumnya.
+     *
      * Libur GLOBAL (Minggu + libur nasional/cuti bersama dari kalender) berlaku sama untuk
      * semua karyawan dan menimpa kategori lain di tanggal yang sama apabila ada kode yang
      * salah diisi pada hari libur. Kode 'l' manual di Keterangan_Lain menjadi tambahan/pendukung
      * untuk tanggal yang menurut kalender adalah hari aktif tapi ternyata tetap libur (mis.
      * cuti bersama/libur nasional yang belum tercakup library).
      *
+     * Kolom "Tanggal Libur" yang ditulis ke template TIDAK menyertakan hari Minggu (Minggu
+     * tetap dihitung libur secara internal supaya tidak dianggap alpa, tapi tidak perlu
+     * dicantumkan satu-satu di kolom karena memang libur mingguan tetap) — yang ditampilkan
+     * hanya libur yang jatuh di hari aktif Senin-Sabtu (mis. libur nasional/cuti bersama yang
+     * ditandai kode 'l').
+     *
      * @param  array<string, array{id:string, nama:string, kosong_absen:string[], tidak_finger_pagi:string[], tidak_finger_sore:string[]}>  $karyawanLog  hasil parseStandardReport()['karyawan']
      * @param  string[]  $liburGlobal  hasil parseStandardReport()['libur_global']
+     * @param  string[]  $liburMinggu  hasil parseStandardReport()['libur_minggu']
      * @param  array<string, array{nama:string, kategori:array<string,string[]>}>  $keterangan  hasil parseKeteranganLain()
      */
-    private function gabungkan(array $karyawanLog, array $liburGlobal, array $keterangan): array
+    private function gabungkan(array $karyawanLog, array $liburGlobal, array $liburMinggu, array $keterangan): array
     {
         $rekap = [];
 
-        // Union ID dari StandardReport (Lap. Log Absen) dan Keterangan_Lain, supaya karyawan
-        // yang HANYA punya catatan sakit/cuti/izin tanpa log fingerprint sama sekali (mis.
-        // sedang cuti panjang sebulan penuh) tetap ikut direkap.
-        $semuaId = array_unique(array_merge(array_keys($karyawanLog), array_keys($keterangan)));
+        // Patokan daftar ID karyawan HANYA dari StandardReport (Lap. Log Absen).
+        // ID yang hanya ada di Keterangan_Lain (tidak ada di Lap. Log Absen) di-skip.
+        $semuaId = array_keys($karyawanLog);
 
         foreach ($semuaId as $id) {
             $dataLog = $karyawanLog[$id] ?? null;
@@ -375,8 +440,15 @@ class AbsensiRekapService
             $libur = array_values(array_unique(array_merge($liburGlobal, $liburManual)));
             $this->sortTanggal($libur);
 
-            // tanggal yang SUDAH dijelaskan (selain kode alpa 'a'); libur juga
-            // "menjelaskan" ketidakhadiran sehingga tidak dianggap alpa.
+            // Untuk KOLOM "Tanggal Libur" yang ditampilkan ke user: buang hari Minggu.
+            // Minggu tidak perlu dicantumkan satu-satu karena memang libur mingguan tetap;
+            // yang ditampilkan hanya libur di hari aktif Senin-Sabtu.
+            $liburTampil = array_values(array_diff($libur, $liburMinggu));
+            $this->sortTanggal($liburTampil);
+
+            // tanggal yang SUDAH dijelaskan (selain kode alpa 'a'); libur (termasuk Minggu)
+            // tetap "menjelaskan" ketidakhadiran sehingga tidak dianggap alpa, walau Minggu
+            // tidak ditampilkan di kolom "Tanggal Libur".
             $sudahDijelaskan = $libur;
             foreach ($kategoriDariKeterangan as $kategori => $tanggalList) {
                 if (in_array($kategori, ['alpa', 'libur'], true)) {
@@ -394,7 +466,7 @@ class AbsensiRekapService
             $rekap[$id] = [
                 'id' => $id,
                 'nama' => $nama,
-                'kategori' => array_merge($kategoriDariKeterangan, ['alpa' => $alpa, 'libur' => $libur]),
+                'kategori' => array_merge($kategoriDariKeterangan, ['alpa' => $alpa, 'libur' => $liburTampil]),
                 'tidak_finger_pagi' => $dataLog['tidak_finger_pagi'] ?? [],
                 'tidak_finger_sore' => $dataLog['tidak_finger_sore'] ?? [],
             ];
@@ -472,7 +544,7 @@ class AbsensiRekapService
             foreach (self::TEMPLATE_DATE_COLUMN as $kategori => $kolom) {
                 $tanggalList = $data['kategori'][$kategori] ?? [];
                 $this->sortTanggal($tanggalList);
-                $sheet->setCellValue($kolom.$targetRow, implode(',', $tanggalList));
+                $sheet->setCellValue($kolom.$targetRow, $this->formatTanggalUntukTampilan($tanggalList));
             }
 
             $sheet->setCellValue('Y'.$targetRow, $this->buatCatatan(
@@ -512,7 +584,7 @@ class AbsensiRekapService
                 continue;
             }
             $this->sortTanggal($tanggalList);
-            $bagian[] = 'tgl '.implode(', ', $tanggalList).' '.$teks;
+            $bagian[] = 'tgl '.$this->formatTanggalUntukTampilan($tanggalList).' '.$teks;
         }
 
         foreach ($kategori as $kategoriKey => $tanggalList) {
@@ -521,17 +593,17 @@ class AbsensiRekapService
             }
             $this->sortTanggal($tanggalList);
             $kode = substr($kategoriKey, strlen('lainnya_'));
-            $bagian[] = 'tgl '.implode(', ', $tanggalList)." kode '{$kode}' (kode tidak dikenal, cek CODE_MAP)";
+            $bagian[] = 'tgl '.$this->formatTanggalUntukTampilan($tanggalList)." kode '{$kode}' (kode tidak dikenal, cek CODE_MAP)";
         }
 
         if (! empty($tidakFingerPagi)) {
             $this->sortTanggal($tidakFingerPagi);
-            $bagian[] = 'tgl '.implode(', ', $tidakFingerPagi).' tidak absen pagi';
+            $bagian[] = 'tgl '.$this->formatTanggalUntukTampilan($tidakFingerPagi).' tidak absen pagi';
         }
 
         if (! empty($tidakFingerSore)) {
             $this->sortTanggal($tidakFingerSore);
-            $bagian[] = 'tgl '.implode(', ', $tidakFingerSore).' tidak absen sore';
+            $bagian[] = 'tgl '.$this->formatTanggalUntukTampilan($tidakFingerSore).' tidak absen sore';
         }
 
         return implode('; ', $bagian);
@@ -652,6 +724,50 @@ class AbsensiRekapService
 
             return $pa['tanggal'] - $pb['tanggal'];
         });
+    }
+
+    /**
+     * Format daftar tanggal (format internal "d/m") menjadi teks yang lebih
+     * mudah dibaca, dikelompokkan per bulan dengan nama bulan Indonesia.
+     *
+     * Contoh: ["26/5","28/5","29/5","1/6","2/6","3/6","4/6","5/6"]
+     *      -> "26, 28, 29 Mei, 1, 2, 3, 4, 5 Juni"
+     *
+     * Catatan: jumlah koma pada hasil akhir tetap sama dengan (jumlah
+     * tanggal - 1), sama seperti format lama "d/m,d/m,...", sehingga
+     * formula hitung jumlah hari di template_gaji.xlsx (yang menghitung
+     * koma) tetap menghasilkan angka yang benar.
+     *
+     * @param  string[]  $tanggalList  idealnya sudah diurutkan lewat sortTanggal()
+     */
+    private function formatTanggalUntukTampilan(array $tanggalList): string
+    {
+        if (empty($tanggalList)) {
+            return '';
+        }
+
+        $kelompokPerBulan = []; // bulan (int) => daftar hari (int)
+        $urutanBulan = [];
+
+        foreach ($tanggalList as $tanggalKey) {
+            $parsed = $this->parseTanggalKey($tanggalKey);
+            $bulan = $parsed['bulan'];
+
+            if (! isset($kelompokPerBulan[$bulan])) {
+                $kelompokPerBulan[$bulan] = [];
+                $urutanBulan[] = $bulan;
+            }
+
+            $kelompokPerBulan[$bulan][] = $parsed['tanggal'];
+        }
+
+        $bagian = [];
+        foreach ($urutanBulan as $bulan) {
+            $namaBulan = self::NAMA_BULAN[$bulan] ?? (string) $bulan;
+            $bagian[] = implode(', ', $kelompokPerBulan[$bulan]).' '.$namaBulan;
+        }
+
+        return implode(', ', $bagian);
     }
 
     /**
